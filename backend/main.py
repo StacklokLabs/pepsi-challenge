@@ -2,10 +2,15 @@ from peft import PeftModel
 import torch
 from fastapi import FastAPI, Request, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import (
+    RedirectResponse,
+    JSONResponse,
+    FileResponse,
+    StreamingResponse,
+)
 import platform
 from authlib.integrations.starlette_client import OAuth
-from models import Session as DBSession, ComparisonResult
+from models import Session as DBSession, ComparisonResult, Mode
 import random
 from config import Config
 import secrets
@@ -43,7 +48,7 @@ app.add_middleware(
 # OAuth setup
 oauth = OAuth()
 oauth.register(
-    name='github',
+    name="github",
     client_id=Config.GITHUB_CLIENT_ID,
     client_secret=Config.GITHUB_CLIENT_SECRET,
     access_token_url=Config.GITHUB_TOKEN_URL,
@@ -51,8 +56,9 @@ oauth.register(
     authorize_url=Config.GITHUB_AUTHORIZE_URL,
     authorize_params=None,
     api_base_url=Config.GITHUB_API_BASE_URL,
-    client_kwargs={'scope': 'user:email read:user'},
+    client_kwargs={"scope": "user:email read:user"},
 )
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -61,6 +67,7 @@ def get_device():
         return "mps"
     return "cpu"
 
+
 device = get_device()
 IS_MACOS = platform.system() == "Darwin"
 
@@ -68,19 +75,22 @@ max_seq_length = 2048
 dtype = None
 load_in_4bit = True and not IS_MACOS
 
+
 def load_base_model(model_name):
     global load_in_4bit
 
     if IS_MACOS:
         from transformers import AutoModelForCausalLM, AutoTokenizer
+
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="auto",
-            torch_dtype=torch.float32 if device == "mps" else torch.float16
+            torch_dtype=torch.float32 if device == "mps" else torch.float16,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     else:
         from unsloth import FastLanguageModel
+
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=max_seq_length,
@@ -89,54 +99,125 @@ def load_base_model(model_name):
         )
     return model, tokenizer
 
+
 def load_peft_model(base_model, peft_model):
     model, tokenizer = load_base_model(base_model)
     model = PeftModel.from_pretrained(model, peft_model)
     return model, tokenizer
 
+
 # Load models
 base_model, tokenizer = load_base_model(Config.BASE_MODEL_NAME)
-peft_model, tokenizer = load_peft_model(Config.BASE_MODEL_NAME, Config.FINETUNED_MODEL_NAME)
+peft_model, tokenizer = load_peft_model(
+    Config.BASE_MODEL_NAME, Config.FINETUNED_MODEL_NAME
+)
 
-def test_completion(model, tokenizer, examples):
-    examples = [f"""<|fim_prefix|>{x["prefix"]}<|fim_suffix|>{x["suffix"]}<|fim_middle|>""" for x in examples]
+
+def test_completion(model, tokenizer, prompt, mode="fim"):
+    if mode == "fim":
+        prompt = [
+            f"""<|fim_prefix|>{x["prefix"]}<|fim_suffix|>{x["suffix"]}<|fim_middle|>"""
+            for x in prompt
+        ]
+    elif mode == "chat":
+        if not prompt:
+            raise ValueError("Chat mode requires prompt.")
+
+        conversation = "\n".join(
+            f"User: {x['message']}\nAI: {x.get('response', '')}" for x in prompt[:-1]
+        )
+        conversation += f"\nUser: {prompt[-1]['message']}\nAI:"
+
+        prompt = [conversation]
 
     if not IS_MACOS:
         from unsloth import FastLanguageModel
+
         FastLanguageModel.for_inference(model)
 
-    inputs = tokenizer(examples, padding=True, return_tensors="pt").to(device)
+    inputs = tokenizer(prompt, padding=True, return_tensors="pt").to(device)
+
     outputs = model.generate(
         **inputs,
         max_new_tokens=128,
         use_cache=True,
-        pad_token_id=tokenizer.pad_token_id
+        pad_token_id=tokenizer.pad_token_id,
     )
+
     outputs = tokenizer.batch_decode(outputs)
-    outputs = [x.split("<|fim_middle|>")[-1].replace("<|endoftext|>", "") for x in outputs]
+
+    if mode == "fim":
+        outputs = [
+            x.split("<|fim_middle|>")[-1].replace("<|endoftext|>", "").strip()
+            for x in outputs
+        ]
+    elif mode == "chat":
+        outputs = [
+            x.split("AI:")[-1].replace("<|endoftext|>", "").strip() for x in outputs
+        ]
+
     return outputs
+
 
 @app.get("/")
 async def home():
     return {"message": "API is running"}
 
+
 @app.post("/api/generate")
-async def generate(request: Request, prefix: str = Form(...), suffix: str = Form(...)):
+async def generate(
+    request: Request,
+    mode: Mode = Form(...),
+    prefix: Optional[str] = Form(None),
+    suffix: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+):
+    """
+    Endpoint that generate code from the model
+    """
+
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    if mode == "fim":
+        if prefix is None or suffix is None:
+            raise HTTPException(
+                status_code=400, detail="Prefix and suffix are required for FIM mode"
+            )
+
+    elif mode == "chat":
+        if not prompt or prompt.strip() == "":
+            chat_prompt = []
+        else:
+            chat_prompt = [{"message": prompt}]
+
+    else:
+        raise HTTPException(
+            status_code=400, detail="Invalid mode. Use 'fim' or 'chat'."
+        )
+
     model_a_is_base = random.choice([True, False])
 
-    base_response = test_completion(base_model, tokenizer, [{"prefix": prefix, "suffix": suffix}])
-    peft_response = test_completion(peft_model, tokenizer, [{"prefix": prefix, "suffix": suffix}])
+    if mode == "fim":
+        base_response = test_completion(
+            base_model, tokenizer, [{"prefix": prefix, "suffix": suffix}], mode="fim"
+        )
+        peft_response = test_completion(
+            peft_model, tokenizer, [{"prefix": prefix, "suffix": suffix}], mode="fim"
+        )
+
+    elif mode == "chat":
+        base_response = test_completion(base_model, tokenizer, chat_prompt, mode="chat")
+        peft_response = test_completion(peft_model, tokenizer, chat_prompt, mode="chat")
 
     print(f"Model A is {'base' if model_a_is_base else 'finetuned'} model")
 
     return {
-        'modelA': base_response[0] if model_a_is_base else peft_response[0],
-        'modelB': peft_response[0] if model_a_is_base else base_response[0],
-        'modelAIsBase': model_a_is_base
+        "modelA": base_response[0] if model_a_is_base else peft_response[0],
+        "modelB": peft_response[0] if model_a_is_base else base_response[0],
+        "modelAIsBase": model_a_is_base,
     }
+
 
 @app.post("/api/submit-preference")
 async def submit_preference(request: Request):
@@ -148,13 +229,13 @@ async def submit_preference(request: Request):
 
     try:
         result = ComparisonResult(
-            github_username=request.session['user']['username'],
+            github_username=request.session["user"]["username"],
             base_model_name=Config.BASE_MODEL_NAME,
             finetuned_model_name=Config.FINETUNED_MODEL_NAME,
-            preferred_model=data['preferredModel'],
-            code_prefix=data['codePrefix'],
-            base_completion=data['baseCompletion'],
-            finetuned_completion=data['finetunedCompletion']
+            preferred_model=data["preferredModel"],
+            code_prefix=data["codePrefix"],
+            base_completion=data["baseCompletion"],
+            finetuned_completion=data["finetunedCompletion"],
         )
 
         db_session.add(result)
@@ -165,6 +246,7 @@ async def submit_preference(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db_session.close()
+
 
 @app.get("/auth/login")
 async def github_login(request: Request, redirect_uri: str = Config.FRONTEND_URL):
@@ -182,18 +264,20 @@ async def github_login(request: Request, redirect_uri: str = Config.FRONTEND_URL
         request, Config.GITHUB_CALLBACK_URL
     )
 
+
 def is_allowed_user(username: str) -> bool:
-    allowed_users = os.getenv('ALLOWED_USERS', '').strip().split(',')
+    allowed_users = os.getenv("ALLOWED_USERS", "").strip().split(",")
     return username.strip() in [u.strip() for u in allowed_users if u]
+
 
 @app.get("/auth/callback")
 async def github_callback(request: Request):
     try:
         token = await oauth.github.authorize_access_token(request)
-        resp = await oauth.github.get('user', token=token)
+        resp = await oauth.github.get("user", token=token)
         user_info = resp.json()
 
-        username = user_info['login']
+        username = user_info["login"]
 
         # Check if user is allowed
         if not is_allowed_user(username):
@@ -202,12 +286,12 @@ async def github_callback(request: Request):
             )
 
         # Store user info in session
-        request.session['user'] = {
-            'username': username,
-            'avatar_url': user_info['avatar_url']
+        request.session["user"] = {
+            "username": username,
+            "avatar_url": user_info["avatar_url"],
         }
 
-        redirect_uri = request.session.pop('redirect_uri', Config.FRONTEND_URL)
+        redirect_uri = request.session.pop("redirect_uri", Config.FRONTEND_URL)
         return RedirectResponse(url=redirect_uri)
 
     except Exception as e:
@@ -216,18 +300,22 @@ async def github_callback(request: Request):
             url=f"{Config.FRONTEND_URL}/error?type=authentication_error&message=An authentication error occurred"
         )
 
+
 @app.get("/auth/logout")
 async def logout(request: Request):
-    request.session.pop('user', None)
+    request.session.pop("user", None)
     return {"success": True, "message": "Logged out successfully"}
+
 
 @app.get("/auth/user")
 async def get_user(request: Request):
-    return request.session.get('user', {})
+    return request.session.get("user", {})
+
 
 def is_admin(username: str) -> bool:
-    admin_users = Config.ADMIN_USERS.split(',')
+    admin_users = Config.ADMIN_USERS.split(",")
     return username in admin_users
+
 
 @app.get("/auth/is_admin")
 async def check_admin(request: Request):
@@ -235,14 +323,17 @@ async def check_admin(request: Request):
         return {"is_admin": False}
     return {"is_admin": is_admin(request.session["user"]["username"])}
 
+
 @app.get("/api/admin/results")
 async def get_results(
     request: Request,
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=100),
-    search: Optional[str] = None
+    search: Optional[str] = None,
 ):
-    if "user" not in request.session or not is_admin(request.session["user"]["username"]):
+    if "user" not in request.session or not is_admin(
+        request.session["user"]["username"]
+    ):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     db_session = DBSession()
@@ -254,7 +345,7 @@ async def get_results(
             or_(
                 ComparisonResult.github_username.ilike(search),
                 ComparisonResult.code_prefix.ilike(search),
-                ComparisonResult.preferred_model.ilike(search)
+                ComparisonResult.preferred_model.ilike(search),
             )
         )
 
@@ -262,33 +353,38 @@ async def get_results(
     total = query.count()
 
     # Get paginated results
-    results = query.order_by(ComparisonResult.created_at.desc()) \
-                  .offset((page - 1) * per_page) \
-                  .limit(per_page) \
-                  .all()
+    results = (
+        query.order_by(ComparisonResult.created_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
 
     # Convert results to dict with both completions
-    results = [{
-        "id": r.id,
-        "github_username": r.github_username,
-        "preferred_model": r.preferred_model,
-        "code_prefix": r.code_prefix,
-        "base_completion": r.base_completion,
-        "finetuned_completion": r.finetuned_completion,
-        "created_at": r.created_at.isoformat(),
-        "completions": [
-            {
-                "model": "base",
-                "completion": r.base_completion,
-                "is_selected": r.preferred_model == "base"
-            },
-            {
-                "model": "finetuned",
-                "completion": r.finetuned_completion,
-                "is_selected": r.preferred_model == "finetuned"
-            }
-        ]
-    } for r in results]
+    results = [
+        {
+            "id": r.id,
+            "github_username": r.github_username,
+            "preferred_model": r.preferred_model,
+            "code_prefix": r.code_prefix,
+            "base_completion": r.base_completion,
+            "finetuned_completion": r.finetuned_completion,
+            "created_at": r.created_at.isoformat(),
+            "completions": [
+                {
+                    "model": "base",
+                    "completion": r.base_completion,
+                    "is_selected": r.preferred_model == "base",
+                },
+                {
+                    "model": "finetuned",
+                    "completion": r.finetuned_completion,
+                    "is_selected": r.preferred_model == "finetuned",
+                },
+            ],
+        }
+        for r in results
+    ]
 
     db_session.close()
 
@@ -297,37 +393,51 @@ async def get_results(
         "total": total,
         "page": page,
         "per_page": per_page,
-        "total_pages": (total + per_page - 1) // per_page
+        "total_pages": (total + per_page - 1) // per_page,
     }
+
 
 @app.get("/auth/error")
 async def auth_error(request: Request, type: str = None, message: str = None):
-    return JSONResponse({
-        "error": type or "authentication_error",
-        "message": message or "An authentication error occurred"
-    })
+    return JSONResponse(
+        {
+            "error": type or "authentication_error",
+            "message": message or "An authentication error occurred",
+        }
+    )
+
 
 @app.get("/api/admin/stats")
 async def get_stats(request: Request):
-    if "user" not in request.session or not is_admin(request.session["user"]["username"]):
+    if "user" not in request.session or not is_admin(
+        request.session["user"]["username"]
+    ):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     db_session = DBSession()
 
     # Get total counts for each model preference
-    base_count = db_session.query(ComparisonResult).filter(
-        ComparisonResult.preferred_model == 'base'
-    ).count()
+    base_count = (
+        db_session.query(ComparisonResult)
+        .filter(ComparisonResult.preferred_model == "base")
+        .count()
+    )
 
-    finetuned_count = db_session.query(ComparisonResult).filter(
-        ComparisonResult.preferred_model == 'finetuned'
-    ).count()
+    finetuned_count = (
+        db_session.query(ComparisonResult)
+        .filter(ComparisonResult.preferred_model == "finetuned")
+        .count()
+    )
 
     total_comparisons = base_count + finetuned_count
 
     # Calculate percentages
-    base_percentage = (base_count / total_comparisons * 100) if total_comparisons > 0 else 0
-    finetuned_percentage = (finetuned_count / total_comparisons * 100) if total_comparisons > 0 else 0
+    base_percentage = (
+        (base_count / total_comparisons * 100) if total_comparisons > 0 else 0
+    )
+    finetuned_percentage = (
+        (finetuned_count / total_comparisons * 100) if total_comparisons > 0 else 0
+    )
 
     db_session.close()
 
@@ -337,19 +447,22 @@ async def get_stats(request: Request):
             {
                 "model": "base",
                 "count": base_count,
-                "percentage": round(base_percentage, 1)
+                "percentage": round(base_percentage, 1),
             },
             {
                 "model": "finetuned",
                 "count": finetuned_count,
-                "percentage": round(finetuned_percentage, 1)
-            }
-        ]
+                "percentage": round(finetuned_percentage, 1),
+            },
+        ],
     }
+
 
 @app.get("/api/analytics/performance")
 async def get_performance_metrics(request: Request):
-    if "user" not in request.session or not is_admin(request.session["user"]["username"]):
+    if "user" not in request.session or not is_admin(
+        request.session["user"]["username"]
+    ):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     db_session = DBSession()
@@ -363,17 +476,15 @@ async def get_performance_metrics(request: Request):
     return {
         "metrics": {
             "avg_completion_time": 1.2,  # seconds
-            "token_usage": {
-                "base_model": 12500,
-                "finetuned_model": 13200
-            },
+            "token_usage": {"base_model": 12500, "finetuned_model": 13200},
             "preference_by_category": {
                 "API Routes": "finetuned",
                 "Database": "base",
                 # etc
-            }
+            },
         }
     }
+
 
 @app.post("/api/review")
 async def generate_review(request: Request, code: str = Form(...)):
@@ -381,17 +492,21 @@ async def generate_review(request: Request, code: str = Form(...)):
 
     prompt = f"Review this code and suggest improvements:\n{code}"
 
-    base_review = test_completion(base_model, tokenizer, [{"prefix": prompt, "suffix": ""}])
-    finetuned_review = test_completion(peft_model, tokenizer, [{"prefix": prompt, "suffix": ""}])
+    base_review = test_completion(
+        base_model, tokenizer, [{"prefix": prompt, "suffix": ""}]
+    )
+    finetuned_review = test_completion(
+        peft_model, tokenizer, [{"prefix": prompt, "suffix": ""}]
+    )
 
-    return {
-        "base_review": base_review[0],
-        "finetuned_review": finetuned_review[0]
-    }
+    return {"base_review": base_review[0], "finetuned_review": finetuned_review[0]}
+
 
 @app.get("/api/admin/export")
 async def export_results(request: Request, format: str = "csv"):
-    if "user" not in request.session or not is_admin(request.session["user"]["username"]):
+    if "user" not in request.session or not is_admin(
+        request.session["user"]["username"]
+    ):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     db_session = DBSession()
@@ -400,36 +515,42 @@ async def export_results(request: Request, format: str = "csv"):
     if format == "csv":
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow([
-            'ID',
-            'Username',
-            'Preferred Model',
-            'Original Prompt',
-            'Selected Completion',
-            'Rejected Completion',
-            'Created At'
-        ])
+        writer.writerow(
+            [
+                "ID",
+                "Username",
+                "Preferred Model",
+                "Original Prompt",
+                "Selected Completion",
+                "Rejected Completion",
+                "Created At",
+            ]
+        )
 
         for result in results:
             # Determine which completion was selected/rejected
             selected_completion = (
-                result.base_completion if result.preferred_model == 'base'
+                result.base_completion
+                if result.preferred_model == "base"
                 else result.finetuned_completion
             )
             rejected_completion = (
-                result.finetuned_completion if result.preferred_model == 'base'
+                result.finetuned_completion
+                if result.preferred_model == "base"
                 else result.base_completion
             )
 
-            writer.writerow([
-                result.id,
-                result.github_username,
-                result.preferred_model,
-                result.code_prefix,
-                selected_completion,
-                rejected_completion,
-                result.created_at.isoformat()
-            ])
+            writer.writerow(
+                [
+                    result.id,
+                    result.github_username,
+                    result.preferred_model,
+                    result.code_prefix,
+                    selected_completion,
+                    rejected_completion,
+                    result.created_at.isoformat(),
+                ]
+            )
 
         output.seek(0)
         db_session.close()
@@ -437,33 +558,38 @@ async def export_results(request: Request, format: str = "csv"):
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=comparison-results.csv"}
+            headers={
+                "Content-Disposition": "attachment; filename=comparison-results.csv"
+            },
         )
 
     elif format == "json":
-        data = [{
-            "id": r.id,
-            "github_username": r.github_username,
-            "preferred_model": r.preferred_model,
-            "code_prefix": r.code_prefix,
-            "base_completion": r.base_completion,
-            "finetuned_completion": r.finetuned_completion,
-            "base_model_name": r.base_model_name,
-            "finetuned_model_name": r.finetuned_model_name,
-            "created_at": r.created_at.isoformat(),
-            "completions": [
-                {
-                    "model": "base",
-                    "completion": r.base_completion,
-                    "is_selected": r.preferred_model == "base"
-                },
-                {
-                    "model": "finetuned",
-                    "completion": r.finetuned_completion,
-                    "is_selected": r.preferred_model == "finetuned"
-                }
-            ]
-        } for r in results]
+        data = [
+            {
+                "id": r.id,
+                "github_username": r.github_username,
+                "preferred_model": r.preferred_model,
+                "code_prefix": r.code_prefix,
+                "base_completion": r.base_completion,
+                "finetuned_completion": r.finetuned_completion,
+                "base_model_name": r.base_model_name,
+                "finetuned_model_name": r.finetuned_model_name,
+                "created_at": r.created_at.isoformat(),
+                "completions": [
+                    {
+                        "model": "base",
+                        "completion": r.base_completion,
+                        "is_selected": r.preferred_model == "base",
+                    },
+                    {
+                        "model": "finetuned",
+                        "completion": r.finetuned_completion,
+                        "is_selected": r.preferred_model == "finetuned",
+                    },
+                ],
+            }
+            for r in results
+        ]
 
         db_session.close()
 
@@ -473,8 +599,11 @@ async def export_results(request: Request, format: str = "csv"):
         return StreamingResponse(
             iter([json_str]),
             media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=comparison-results.json"}
+            headers={
+                "Content-Disposition": "attachment; filename=comparison-results.json"
+            },
         )
+
 
 @app.post("/api/collaborate")
 async def start_collaboration(request: Request):
@@ -486,13 +615,11 @@ async def start_collaboration(request: Request):
     collaboration_sessions[session_id] = {
         "code_prefix": request.json["prefix"],
         "participants": [request.session["user"]["username"]],
-        "votes": {
-            "base": 0,
-            "finetuned": 0
-        }
+        "votes": {"base": 0, "finetuned": 0},
     }
 
     return {"session_id": session_id}
+
 
 @app.post("/api/explain")
 async def explain_completion(request: Request, completion_id: int):
@@ -503,9 +630,12 @@ async def explain_completion(request: Request, completion_id: int):
 
     explanation_prompt = f"Explain why you generated this completion:\n{completion.code_prefix}\n{completion.base_completion}"
 
-    explanation = test_completion(base_model, tokenizer, [{"prefix": explanation_prompt, "suffix": ""}])
+    explanation = test_completion(
+        base_model, tokenizer, [{"prefix": explanation_prompt, "suffix": ""}]
+    )
 
     return {"explanation": explanation[0]}
+
 
 @app.get("/api/user/stats")
 async def get_user_stats(request: Request):
@@ -516,22 +646,29 @@ async def get_user_stats(request: Request):
     db_session = DBSession()
 
     # Get user's comparison history
-    user_comparisons = db_session.query(ComparisonResult).filter(
-        ComparisonResult.github_username == username
-    ).order_by(ComparisonResult.created_at.desc()).all()
+    user_comparisons = (
+        db_session.query(ComparisonResult)
+        .filter(ComparisonResult.github_username == username)
+        .order_by(ComparisonResult.created_at.desc())
+        .all()
+    )
 
     # Calculate statistics
     total_comparisons = len(user_comparisons)
-    base_preferred = sum(1 for c in user_comparisons if c.preferred_model == 'base')
+    base_preferred = sum(1 for c in user_comparisons if c.preferred_model == "base")
     finetuned_preferred = total_comparisons - base_preferred
 
     # Get recent comparisons
     recent_comparisons = [
         {
             "id": c.id,
-            "code_prefix": c.code_prefix[:100] + "..." if len(c.code_prefix) > 100 else c.code_prefix,
+            "code_prefix": (
+                c.code_prefix[:100] + "..."
+                if len(c.code_prefix) > 100
+                else c.code_prefix
+            ),
             "preferred_model": c.preferred_model,
-            "created_at": c.created_at.isoformat()
+            "created_at": c.created_at.isoformat(),
         }
         for c in user_comparisons[:5]  # Last 5 comparisons
     ]
@@ -540,13 +677,12 @@ async def get_user_stats(request: Request):
 
     return {
         "total_comparisons": total_comparisons,
-        "preferences": {
-            "base": base_preferred,
-            "finetuned": finetuned_preferred
-        },
-        "recent_comparisons": recent_comparisons
+        "preferences": {"base": base_preferred, "finetuned": finetuned_preferred},
+        "recent_comparisons": recent_comparisons,
     }
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="localhost", port=8000)
